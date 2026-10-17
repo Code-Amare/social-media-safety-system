@@ -2,7 +2,7 @@ SafeSpace — AI-Assisted Digital Wellbeing and Child Online Safety
 
 About the Project
 
-SafeSpace is an AI-powered project I developed during my learning experience at the EGATE Talent Center summer camp. It focuses on two important problems: unhealthy digital habits and children’s online safety.
+SafeSpace is an AI-powered project. It focuses on two important problems: unhealthy digital habits and children’s online safety.
 
 I built this project to explore how Artificial Intelligence (AI) and Machine Learning (ML) can help people develop healthier relationships with technology while helping parents and guardians protect children from potentially inappropriate online content.
 
