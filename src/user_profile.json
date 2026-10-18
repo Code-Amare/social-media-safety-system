@@ -1,0 +1,9 @@
+{
+    "age": 21,
+    "gender": "Male",
+    "work_study_hours": 4.0,
+    "sleep_hours": 7.0,
+    "stress_level": "Medium",
+    "academic_work_impact": "No",
+    "weekend_screen_time": 4.0
+}

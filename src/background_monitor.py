@@ -1,34 +1,9 @@
 # ============================================================
-# EGATE AI - UNIFIED BACKGROUND MONITOR
+# EGATE AI - UNIFIED BACKGROUND MONITOR (Windows)
 # ============================================================
-#
-# This SINGLE program handles:
-#
-# 1. NSFW screen detection
-# 2. YouTube intervention video
-# 3. Addiction-risk prediction using your trained XGBoost model
-# 4. Telegram family alerts
-# 5. Telegram registration code
-# 6. 5-minute intervention/cooldown
-#
-# IMPORTANT:
-# - m.csv is used to TRAIN the model.
-# - addiction_pipeline.pkl is used by this program.
-# - The addiction model does NOT use screenshots.
-# - The NSFW model DOES use screenshots.
-#
-# ============================================================
-
-
-# ============================================================
-# IMPORTS
-# ============================================================
-
 import os
-# ============================================================
-# ENVIRONMENT VARIABLES
-# MUST BE SET BEFORE IMPORTING TRANSFORMERS
-# ============================================================
+import sys
+
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -36,1745 +11,631 @@ os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
-import sys
-import time
+# Windows: emoji printed into a redirected log file crash without this.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import json
 import secrets
 import threading
-import subprocess
+import time
+import webbrowser
+from pathlib import Path
 
 import joblib
 import pandas as pd
 import requests
-
-
-
-
-
-# ============================================================
-# THIRD-PARTY IMPORTS
-# ============================================================
-
+import torch  # noqa: F401
+from dotenv import load_dotenv
 from PIL import ImageGrab
 from transformers.pipelines import pipeline
 
+# ============================================================
+# PATHS  (project/src/background_monitor.py)
+# ============================================================
+SRC_DIR = Path(__file__).resolve().parent  # project/src
+ROOT_DIR = SRC_DIR.parent  # project
+DATA_DIR = SRC_DIR  # all json/log files live in src/
+
+load_dotenv(SRC_DIR / ".env")
+load_dotenv()
+
+MODEL_PATH = ROOT_DIR / "models" / "addiction_pipeline.pkl"
+
+PROFILE_PATH = DATA_DIR / "user_profile.json"
+USAGE_PATH = DATA_DIR / "current_usage.json"
+TELEGRAM_AUTH_PATH = DATA_DIR / "telegram_authorized.json"
+TELEGRAM_CODE_SUBMIT_PATH = DATA_DIR / "telegram_code_submit.json"
+TELEGRAM_PAIRING_STATUS_PATH = DATA_DIR / "telegram_pairing_status.json"
+PENDING_CODES_PATH = DATA_DIR / "telegram_pending_codes.json"
+LOG_FILE = DATA_DIR / "monitor_debug.log"
 
 # ============================================================
-# PATHS
+# SETTINGS
 # ============================================================
-
-BASE_DIR = "/Users/mo/Egate_Ai_camp"
-
-MODEL_PATH = os.path.join(
-    BASE_DIR,
-    "addiction_pipeline.pkl"
-)
-
-PROFILE_PATH = os.path.join(
-    BASE_DIR,
-    "user_profile.json"
-)
-
-USAGE_PATH = os.path.join(
-    BASE_DIR,
-    "current_usage.json"
-)
-
-TELEGRAM_AUTH_PATH = os.path.join(
-    BASE_DIR,
-    "telegram_authorized.json"
-)
-
-# Written by the Streamlit dashboard when the user submits a code there.
-TELEGRAM_CODE_SUBMIT_PATH = os.path.join(
-    BASE_DIR,
-    "telegram_code_submit.json"
-)
-
-# Written by this monitor so the dashboard can show the pairing result.
-TELEGRAM_PAIRING_STATUS_PATH = os.path.join(
-    BASE_DIR,
-    "telegram_pairing_status.json"
-)
-
-LOG_FILE = os.path.join(
-    BASE_DIR,
-    "monitor_debug.log"
-)
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-TELEGRAM_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN"
-)
-
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 REGISTRATION_CODE_LIFETIME = 600  # 10 minutes
 
-
-# ============================================================
-# NSFW SETTINGS
-# ============================================================
-
 NSFW_THRESHOLD = 0.10
-
 CHECK_INTERVAL_SECONDS = 3
-
-# Prevent repeatedly triggering the same event.
 NSFW_COOLDOWN_SECONDS = 30
 
-
-# ============================================================
-# ADDICTION SETTINGS
-# ============================================================
-
-# Check the addiction model every 5 minutes.
 ADDICTION_CHECK_INTERVAL = 300
-
-# Telegram alert threshold.
 ADDICTION_HIGH_RISK_THRESHOLD = 0.10
 
-
-# ============================================================
-# INTERVENTION
-# ============================================================
-
-LOCKOUT_DURATION = 300  # 5 minutes
-
-YOUTUBE_URL = (
-    "https://www.youtube.com/watch?v=1ZYbU82GVz4"
-)
-
+LOCKOUT_DURATION = 300
+YOUTUBE_URL = "https://www.youtube.com/watch?v=1ZYbU82GVz4"
 
 # ============================================================
 # GLOBAL STATE
 # ============================================================
-
 authorized_chat_id = None
-
 pending_codes = {}
-
 telegram_lock = threading.Lock()
-
 last_nsfw_alert_time = 0
-
 last_addiction_alert_time = 0
-
 monitor_running = True
 
 
 # ============================================================
-# LOGGING
+# LOGGING / JSON HELPERS
 # ============================================================
-
 def log(message):
-
     try:
-
-        with open(
-            LOG_FILE,
-            "a",
-            encoding="utf-8"
-        ) as log_f:
-
-            timestamp = time.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-
-            log_f.write(
-                f"[{timestamp}] {message}\n"
-            )
-
-            log_f.flush()
-
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
     except Exception:
-
         pass
+
+
+def write_json_atomic(path, data):
+    tmp = Path(str(path) + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
 
 
 # ============================================================
 # TELEGRAM AUTH STORAGE
 # ============================================================
-
 def load_authorized_chat():
-
     global authorized_chat_id
-
     try:
-
-        with open(
-            TELEGRAM_AUTH_PATH,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            data = json.load(f)
-
-        authorized_chat_id = data.get(
-            "chat_id"
-        )
-
+        with open(TELEGRAM_AUTH_PATH, "r", encoding="utf-8") as f:
+            authorized_chat_id = json.load(f).get("chat_id")
         if authorized_chat_id:
-
-            log(
-                f"Authorized Telegram account loaded: "
-                f"{authorized_chat_id}"
-            )
-
+            log(f"Authorized Telegram account loaded: {authorized_chat_id}")
     except Exception:
-
         authorized_chat_id = None
 
 
 def save_authorized_chat(chat_id):
-
     global authorized_chat_id
-
     try:
-
-        with open(
-            TELEGRAM_AUTH_PATH,
-            "w",
-            encoding="utf-8"
-        ) as f:
-
-            json.dump(
-                {
-                    "chat_id": chat_id
-                },
-                f,
-                indent=2
-            )
-
+        write_json_atomic(TELEGRAM_AUTH_PATH, {"chat_id": chat_id})
         authorized_chat_id = chat_id
-
-        log(
-            f"Telegram account authorized: {chat_id}"
-        )
-
+        log(f"Telegram account authorized: {chat_id}")
     except Exception as e:
-
-        log(
-            f"Could not save Telegram authorization: {e}"
-        )
+        log(f"Could not save Telegram authorization: {e}")
 
 
-load_authorized_chat()
+# ============================================================
+# PENDING CODES (persisted across monitor restarts)
+# ============================================================
+def save_pending_codes():
+    """Call while holding telegram_lock."""
+    try:
+        write_json_atomic(PENDING_CODES_PATH, pending_codes)
+    except Exception as e:
+        log(f"Could not save pending codes: {e}")
+
+
+def load_pending_codes():
+    try:
+        with open(PENDING_CODES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        now = time.time()
+        with telegram_lock:
+            for code, info in data.items():
+                if info.get("expires", 0) > now:
+                    pending_codes[code] = info
+    except Exception:
+        pass
 
 
 # ============================================================
 # TELEGRAM API
 # ============================================================
-
-def telegram_api(
-    method,
-    data=None
-):
-
+def telegram_api(method, data=None, timeout=30):
     if not TELEGRAM_TOKEN:
-
         return None
-
-    url = (
-        "https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/{method}"
-    )
-
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
     try:
-
-        response = requests.post(
-            url,
-            data=data or {},
-            timeout=30
-        )
-
+        response = requests.post(url, data=data or {}, timeout=timeout)
         return response.json()
-
     except Exception as e:
-
-        log(
-            f"Telegram API error: {e}"
-        )
-
+        log(f"Telegram API error ({method}): {e}")
         return None
 
 
-# ============================================================
-# TELEGRAM MESSAGE
-# ============================================================
-
-def send_telegram_message(
-    chat_id,
-    message
-):
-
+def send_telegram_message(chat_id, message):
     if not chat_id:
-
         return False
-
-    result = telegram_api(
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": message
-        }
-    )
-
+    result = telegram_api("sendMessage", {"chat_id": chat_id, "text": message})
     if result and result.get("ok"):
-
-        log(
-            f"Telegram message sent to {chat_id}"
-        )
-
+        log(f"Telegram message sent to {chat_id}")
         return True
-
-    log(
-        f"Telegram send failed: {result}"
-    )
-
+    log(f"Telegram send failed: {result}")
     return False
 
 
-# ============================================================
-# TELEGRAM REGISTRATION CODE
-# ============================================================
-
 def generate_registration_code():
-
     return f"{secrets.randbelow(1000000):06d}"
+
+
+def issue_code(chat_id, first_time):
+    code = generate_registration_code()
+    expires = time.time() + REGISTRATION_CODE_LIFETIME
+
+    with telegram_lock:
+        for old in [c for c, i in pending_codes.items() if i["chat_id"] == chat_id]:
+            pending_codes.pop(old, None)
+        pending_codes[code] = {"chat_id": chat_id, "expires": expires}
+        save_pending_codes()
+
+    intro = "👋 Welcome to Egate AI.\n\n" if first_time else ""
+    send_telegram_message(
+        chat_id,
+        f"{intro}Your computer registration code is:\n\n🔐 {code}\n\n"
+        "Enter this 6-digit code on the Egate AI dashboard.\n\n"
+        "⏱ The code expires in 10 minutes.",
+    )
+    log(f"Registration code generated for chat {chat_id}: {code}")
 
 
 # ============================================================
 # TELEGRAM LISTENER
 # ============================================================
+def parse_command(text):
+    if not text or not text.strip():
+        return ""
+    return text.strip().split()[0].lower().split("@")[0]
+
 
 def telegram_listener():
+    log("Telegram listener started.")
 
-    log(
-        "Telegram listener started."
-    )
-
-    # Make sure polling works.
-    result = telegram_api(
-        "deleteWebhook",
-        {
-            "drop_pending_updates": False
-        }
-    )
-
+    result = telegram_api("deleteWebhook", {"drop_pending_updates": "false"})
     if result and result.get("ok"):
-
-        log(
-            "Telegram webhook disabled."
-        )
-
-    # Start from newest update.
-    initial = telegram_api(
-        "getUpdates"
-    )
+        log("Telegram webhook disabled.")
 
     offset = 0
 
-    if initial and initial.get("ok"):
-
-        updates = initial.get(
-            "result",
-            []
-        )
-
-        if updates:
-
-            offset = (
-                updates[-1]["update_id"] + 1
-            )
-
-
     while monitor_running:
-
         try:
-
             result = telegram_api(
-                "getUpdates",
-                {
-                    "offset": offset,
-                    "timeout": 20
-                }
+                "getUpdates", {"offset": offset, "timeout": 20}, timeout=35
             )
 
             if not result or not result.get("ok"):
-
+                if result and result.get("error_code") == 409:
+                    log(
+                        "Telegram 409 conflict: another program is polling "
+                        "this bot (another monitor instance?)."
+                    )
                 time.sleep(3)
-
                 continue
 
+            for update in result.get("result", []):
+                offset = update["update_id"] + 1
 
-            updates = result.get(
-                "result",
-                []
-            )
-
-
-            for update in updates:
-
-                offset = (
-                    update["update_id"] + 1
-                )
-
-                message = update.get(
-                    "message"
-                )
-
+                message = update.get("message")
                 if not message:
-
                     continue
 
-                text = (
-                    message
-                    .get("text", "")
-                    .strip()
-                    .lower()
-                )
+                if time.time() - message.get("date", 0) > REGISTRATION_CODE_LIFETIME:
+                    continue
 
-                chat = message.get(
-                    "chat",
-                    {}
-                )
-
-                chat_id = chat.get(
-                    "id"
-                )
-
+                chat_id = message.get("chat", {}).get("id")
                 if not chat_id:
-
                     continue
 
+                command = parse_command(message.get("text", ""))
 
-                # ==================================================
-                # /start
-                # ==================================================
+                if command == "/start":
+                    issue_code(chat_id, first_time=True)
 
-                if text == "/start":
+                elif command == "/newcode":
+                    issue_code(chat_id, first_time=False)
 
-                    code = (
-                        generate_registration_code()
-                    )
-
-                    expires = (
-                        time.time()
-                        + REGISTRATION_CODE_LIFETIME
-                    )
-
-                    with telegram_lock:
-
-                        pending_codes[code] = {
-                            "chat_id": chat_id,
-                            "expires": expires
-                        }
-
-
-                    send_telegram_message(
-                        chat_id,
-                        (
-                            "👋 Welcome to Egate AI.\n\n"
-                            "Your computer registration code is:\n\n"
-                            f"🔐 {code}\n\n"
-                            "Enter this 6-digit code "
-                            "on the computer running "
-                            "Egate AI.\n\n"
-                            "⏱ The code expires in "
-                            "10 minutes."
-                        )
-                    )
-
-                    log(
-                        f"Registration code generated "
-                        f"for chat {chat_id}: {code}"
-                    )
-
-
-                # ==================================================
-                # /newcode
-                # ==================================================
-
-                elif text == "/newcode":
-
-                    code = (
-                        generate_registration_code()
-                    )
-
-                    expires = (
-                        time.time()
-                        + REGISTRATION_CODE_LIFETIME
-                    )
-
-                    with telegram_lock:
-
-                        pending_codes[code] = {
-                            "chat_id": chat_id,
-                            "expires": expires
-                        }
-
-
-                    send_telegram_message(
-                        chat_id,
-                        (
-                            "🔐 New registration code:\n\n"
-                            f"{code}\n\n"
-                            "This code expires in "
-                            "10 minutes."
-                        )
-                    )
-
-
-                # ==================================================
-                # /status
-                # ==================================================
-
-                elif text == "/status":
-
+                elif command == "/status":
                     if authorized_chat_id == chat_id:
-
-                        message_text = (
-                            "✅ This Telegram account "
-                            "is paired with Egate AI."
+                        send_telegram_message(
+                            chat_id, "✅ This Telegram account is paired with Egate AI."
                         )
-
                     else:
-
-                        message_text = (
-                            "⚠️ This Telegram account "
-                            "is not paired."
+                        send_telegram_message(
+                            chat_id, "⚠️ This Telegram account is not paired."
                         )
 
-                    send_telegram_message(
-                        chat_id,
-                        message_text
-                    )
-
-
-                # ==================================================
-                # /test
-                # ==================================================
-
-                elif text == "/test":
-
+                elif command == "/test":
                     if authorized_chat_id == chat_id:
-
                         send_telegram_message(
                             chat_id,
-                            (
-                                "🟢 Egate AI test successful.\n\n"
-                                "Telegram alerts are working."
-                            )
+                            "🟢 Egate AI test successful.\n\nTelegram alerts are working.",
                         )
-
                     else:
-
                         send_telegram_message(
-                            chat_id,
-                            (
-                                "⚠️ This account is not "
-                                "paired with the computer."
-                            )
+                            chat_id, "⚠️ This account is not paired with the computer."
                         )
 
         except Exception as e:
-
-            log(
-                f"Telegram listener error: {e}"
-            )
-
+            log(f"Telegram listener error: {e}")
             time.sleep(5)
 
 
 # ============================================================
-# REGISTER COMPUTER WITH FAMILY TELEGRAM
+# PAIRING VIA DASHBOARD
 # ============================================================
-
 def _write_pairing_status(status, message):
-
     try:
-
-        with open(
+        write_json_atomic(
             TELEGRAM_PAIRING_STATUS_PATH,
-            "w",
-            encoding="utf-8"
-        ) as f:
-
-            json.dump(
-                {
-                    "status": status,
-                    "message": message,
-                    "updated_at": time.time()
-                },
-                f,
-                indent=2
-            )
-
-    except Exception as e:
-
-        log(
-            f"Could not write pairing status: {e}"
+            {"status": status, "message": message, "updated_at": time.time()},
         )
+    except Exception as e:
+        log(f"Could not write pairing status: {e}")
 
 
 def check_code_submission():
-    """
-    Non-blocking replacement for the old terminal-based
-    register_computer(). Looks for a code the Streamlit
-    dashboard wrote to TELEGRAM_CODE_SUBMIT_PATH, validates
-    it against pending_codes, and reports the result back
-    through TELEGRAM_PAIRING_STATUS_PATH. Always deletes the
-    submit file after handling it so it's never reprocessed.
-    """
-
-    if not os.path.exists(TELEGRAM_CODE_SUBMIT_PATH):
-
+    if not TELEGRAM_CODE_SUBMIT_PATH.exists():
         return
 
     try:
-
-        with open(
-            TELEGRAM_CODE_SUBMIT_PATH,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            submitted = json.load(f)
-
-        code = str(
-            submitted.get("code", "")
-        ).strip()
-
+        with open(TELEGRAM_CODE_SUBMIT_PATH, "r", encoding="utf-8") as f:
+            code = str(json.load(f).get("code", "")).strip()
     except Exception as e:
+        log(f"Could not read submitted Telegram code: {e}")
+        code = ""
 
-        log(
-            f"Could not read submitted Telegram code: {e}"
-        )
-
-        try:
-            os.remove(TELEGRAM_CODE_SUBMIT_PATH)
-        except Exception:
-            pass
-
-        return
-
-    # Always remove the request file so a stale/duplicate
-    # copy is never picked up again on the next poll.
     try:
         os.remove(TELEGRAM_CODE_SUBMIT_PATH)
     except Exception:
         pass
 
+    with telegram_lock:
+        known = list(pending_codes.keys())
+    log(f"Code submitted: '{code}' | pending codes: {known}")
+
     if len(code) != 6 or not code.isdigit():
-
-        _write_pairing_status(
-            "error",
-            "Enter exactly 6 digits."
-        )
-
+        _write_pairing_status("error", "Enter exactly 6 digits.")
         return
 
     with telegram_lock:
-
         registration = pending_codes.get(code)
 
     if not registration:
-
         _write_pairing_status(
             "error",
-            "Invalid registration code. Send /start to the "
-            "bot again for a new one."
+            "Invalid registration code. Send /newcode to the bot for a new one.",
         )
-
         return
 
     if time.time() > registration["expires"]:
-
         with telegram_lock:
-
             pending_codes.pop(code, None)
-
+            save_pending_codes()
         _write_pairing_status(
-            "error",
-            "That code expired. Send /start to the bot again "
-            "for a new one."
+            "error", "That code expired. Send /newcode to the bot for a new one."
         )
-
         return
 
     chat_id = registration["chat_id"]
-
     save_authorized_chat(chat_id)
 
     with telegram_lock:
-
         pending_codes.pop(code, None)
+        save_pending_codes()
 
     send_telegram_message(
         chat_id,
-        (
-            "✅ COMPUTER PAIRED\n\n"
-            "This Telegram account is now "
-            "connected to Egate AI.\n\n"
-            "You will receive safety alerts "
-            "from the computer."
-        )
+        "✅ COMPUTER PAIRED\n\nThis Telegram account is now connected to "
+        "Egate AI.\n\nYou will receive safety alerts from the computer.",
     )
-
-    _write_pairing_status(
-        "success",
-        "Computer paired successfully."
-    )
-
-    log(
-        f"Telegram pairing completed via dashboard for chat_id {chat_id}"
-    )
+    _write_pairing_status("success", "Computer paired successfully.")
+    log(f"Telegram pairing completed via dashboard for chat_id {chat_id}")
 
 
 def code_submission_watcher():
-    """
-    Runs forever in its own daemon thread, polling for a code
-    the dashboard has submitted. This is what lets pairing
-    happen from the Streamlit app instead of this script's
-    terminal — and it keeps working at any point while the
-    monitor is running, not just at startup.
-    """
-
     log("Telegram code-submission watcher started.")
-
-    while True:
-
+    while monitor_running:
         try:
-
             check_code_submission()
-
         except Exception as e:
-
-            log(
-                f"Code-submission watcher error: {e}"
-            )
-
-        time.sleep(1)
-
-
-        print()
-        print(
-            "✅ Computer successfully paired!"
-        )
-
-        return True
+            log(f"Code-submission watcher error: {e}")
+        time.sleep(0.5)
 
 
 # ============================================================
-# LOAD USER PROFILE
+# PROFILE / USAGE
 # ============================================================
-
 def load_user_profile():
+    if not PROFILE_PATH.exists():
+        raise FileNotFoundError(f"Missing: {PROFILE_PATH}")
+    with open(PROFILE_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-    if not os.path.exists(
-        PROFILE_PATH
-    ):
-
-        raise FileNotFoundError(
-            f"Missing:\n{PROFILE_PATH}"
-        )
-
-
-    with open(
-        PROFILE_PATH,
-        "r",
-        encoding="utf-8"
-    ) as f:
-
-        profile = json.load(f)
-
-
-    return profile
-
-
-# ============================================================
-# LOAD CURRENT MAC USAGE
-# ============================================================
 
 def load_usage_data():
-
-    if not os.path.exists(
-        USAGE_PATH
-    ):
-
-        raise FileNotFoundError(
-            f"Missing:\n{USAGE_PATH}\n\n"
-            "The macOS usage collector has not "
-            "created the file yet."
-        )
-
-
-    with open(
-        USAGE_PATH,
-        "r",
-        encoding="utf-8"
-    ) as f:
-
-        usage = json.load(f)
-
-
-    return usage
+    if not USAGE_PATH.exists():
+        raise FileNotFoundError(f"Missing: {USAGE_PATH}")
+    with open(USAGE_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 # ============================================================
-# LOAD ADDICTION MODEL
+# ADDICTION MODEL
 # ============================================================
-
 def load_addiction_model():
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
 
-    if not os.path.exists(
-        MODEL_PATH
-    ):
-
-        raise FileNotFoundError(
-            f"Missing model:\n{MODEL_PATH}"
-        )
+    artifact = joblib.load(MODEL_PATH)
+    log(f"Addiction model loaded from {MODEL_PATH}")
+    return artifact["preprocessor"], artifact["model"], artifact["feature_columns"]
 
 
-    artifact = joblib.load(
-        MODEL_PATH
-    )
-
-
-    preprocessor = artifact[
-        "preprocessor"
-    ]
-
-    model = artifact[
-        "model"
-    ]
-
-    feature_columns = artifact[
-        "feature_columns"
-    ]
-
-
-    log(
-        "Addiction model loaded successfully."
-    )
-
-
-    return (
-        preprocessor,
-        model,
-        feature_columns
-    )
-
-
-# ============================================================
-# BUILD ADDICTION MODEL FEATURES
-# ============================================================
-
-def build_addiction_features(
-    profile,
-    usage,
-    feature_columns
-):
-
+def build_addiction_features(profile, usage, feature_columns):
     features = {
-
-        # ----------------------------------------------
-        # From macOS usage collector
-        # ----------------------------------------------
-
-        "daily_screen_time_hours":
-            usage.get(
-                "daily_screen_time_hours",
-                0.0
-            ),
-
-        "social_media_hours":
-            usage.get(
-                "social_media_hours",
-                0.0
-            ),
-
-        "gaming_hours":
-            usage.get(
-                "gaming_hours",
-                0.0
-            ),
-
-        "notifications_per_day":
-            usage.get(
-                "notifications_per_day",
-                0
-            ),
-
-        "app_opens_per_day":
-            usage.get(
-                "app_opens_per_day",
-                0
-            ),
-
-        "weekend_screen_time":
-            usage.get(
-                "weekend_screen_time",
-                profile.get(
-                    "weekend_screen_time",
-                    0.0
-                )
-            ),
-
-
-        # ----------------------------------------------
-        # From user profile
-        # ----------------------------------------------
-
-        "age":
-            profile.get(
-                "age"
-            ),
-
-        "gender":
-            profile.get(
-                "gender"
-            ),
-
-        "work_study_hours":
-            profile.get(
-                "work_study_hours",
-                0.0
-            ),
-
-        "sleep_hours":
-            profile.get(
-                "sleep_hours",
-                7.0
-            ),
-
-        "stress_level":
-            profile.get(
-                "stress_level",
-                "Medium"
-            ),
-
-        "academic_work_impact":
-            profile.get(
-                "academic_work_impact",
-                "No"
-            ),
+        "daily_screen_time_hours": usage.get("daily_screen_time_hours", 0.0),
+        "social_media_hours": usage.get("social_media_hours", 0.0),
+        "gaming_hours": usage.get("gaming_hours", 0.0),
+        "notifications_per_day": usage.get("notifications_per_day", 0),
+        "app_opens_per_day": usage.get("app_opens_per_day", 0),
+        "weekend_screen_time": usage.get(
+            "weekend_screen_time", profile.get("weekend_screen_time", 0.0)
+        ),
+        "age": profile.get("age"),
+        "gender": profile.get("gender"),
+        "work_study_hours": profile.get("work_study_hours", 0.0),
+        "sleep_hours": profile.get("sleep_hours", 7.0),
+        "stress_level": profile.get("stress_level", "Medium"),
+        "academic_work_impact": profile.get("academic_work_impact", "No"),
     }
 
-
-    # ========================================================
-    # CHECK MODEL FEATURES
-    # ========================================================
-
-    missing = []
-
-    for column in feature_columns:
-
-        value = features.get(
-            column
-        )
-
-        if value is None:
-
-            missing.append(
-                column
-            )
-
-
+    missing = [c for c in feature_columns if features.get(c) is None]
     if missing:
+        raise ValueError("Missing model features: " + ", ".join(missing))
 
-        raise ValueError(
-            "Missing model features: "
-            + ", ".join(missing)
-        )
+    return pd.DataFrame([features], columns=feature_columns)
 
 
-    return pd.DataFrame(
-        [features],
-        columns=feature_columns
-    )
-
-
-# ============================================================
-# RUN ADDICTION MODEL
-# ============================================================
-
-def predict_addiction(
-    preprocessor,
-    model,
-    feature_columns
-):
-
+def predict_addiction(preprocessor, model, feature_columns):
     profile = load_user_profile()
-
     usage = load_usage_data()
+    X = build_addiction_features(profile, usage, feature_columns)
+    X_encoded = preprocessor.transform(X)
+
+    classes = list(getattr(model, "classes_", [0, 1]))
+    idx = classes.index(1) if 1 in classes else 1
+    probability = float(model.predict_proba(X_encoded)[0][idx])
+
+    return int(probability >= 0.50), probability, X.iloc[0].to_dict()
 
 
-    X = build_addiction_features(
-        profile,
-        usage,
-        feature_columns
-    )
-
-
-    X_encoded = (
-        preprocessor.transform(
-            X
-        )
-    )
-
-
-    probability = float(
-        model.predict_proba(
-            X_encoded
-        )[0][1]
-    )
-
-
-    prediction = int(
-        probability >= 0.50
-    )
-
-
-    return (
-        prediction,
-        probability,
-        X.iloc[0].to_dict()
-    )
-
-
-# ============================================================
-# ADDICTION TELEGRAM ALERT
-# ============================================================
-
-def send_addiction_alert(
-    probability,
-    features
-):
-
+def send_addiction_alert(probability, features):
     global last_addiction_alert_time
 
-
     if not authorized_chat_id:
-
-        log(
-            "Addiction alert skipped: "
-            "no Telegram account paired."
-        )
-
+        log("Addiction alert skipped: no Telegram account paired.")
         return
-
 
     now = time.time()
-
-
-    # Prevent alert spam.
-    if (
-        now - last_addiction_alert_time
-        < ADDICTION_CHECK_INTERVAL
-    ):
-
+    if now - last_addiction_alert_time < ADDICTION_CHECK_INTERVAL:
         return
-
 
     message = (
         "⚠️ EGATE AI USAGE ALERT\n\n"
-
-        f"Estimated model risk: "
-        f"{probability:.1%}\n\n"
-
-        f"Daily screen time: "
-        f"{features['daily_screen_time_hours']:.1f} h\n"
-
-        f"Social media: "
-        f"{features['social_media_hours']:.1f} h\n"
-
-        f"Gaming: "
-        f"{features['gaming_hours']:.1f} h\n"
-
-        f"Work/study: "
-        f"{features['work_study_hours']:.1f} h\n"
-
-        f"Sleep: "
-        f"{features['sleep_hours']:.1f} h\n"
-
-        f"Notifications: "
-        f"{features['notifications_per_day']}\n"
-
-        f"App opens: "
-        f"{features['app_opens_per_day']}\n\n"
-
+        f"Estimated model risk: {probability:.1%}\n\n"
+        f"Daily screen time: {features['daily_screen_time_hours']:.1f} h\n"
+        f"Social media: {features['social_media_hours']:.1f} h\n"
+        f"Gaming: {features['gaming_hours']:.1f} h\n"
+        f"Work/study: {features['work_study_hours']:.1f} h\n"
+        f"Sleep: {features['sleep_hours']:.1f} h\n"
+        f"Notifications: {features['notifications_per_day']}\n"
+        f"App opens: {features['app_opens_per_day']}\n\n"
         "Please review the usage pattern."
     )
 
-
-    if send_telegram_message(
-        authorized_chat_id,
-        message
-    ):
-
+    if send_telegram_message(authorized_chat_id, message):
         last_addiction_alert_time = now
 
 
 # ============================================================
-# NSFW DETECTION MODEL
+# NSFW DETECTION
 # ============================================================
-
 def load_nsfw_model():
-
-    log(
-        "Loading NSFW detection model..."
-    )
-
-
+    log("Loading NSFW detection model...")
     classifier = pipeline(
-        "image-classification",
-        model="Falconsai/nsfw_image_detection",
-        device=-1
+        "image-classification", model="Falconsai/nsfw_image_detection", device=-1
     )
-
-
-    log(
-        "NSFW detection model loaded."
-    )
-
-
+    log("NSFW detection model loaded.")
     return classifier
 
 
-# ============================================================
-# DETECT NSFW
-# ============================================================
-
-def get_nsfw_score(
-    classifier,
-    screen
-):
-
-    results = classifier(
-        screen
-    )
+def get_nsfw_score(classifier, screen):
+    for item in classifier(screen):
+        if str(item.get("label", "")).lower() == "nsfw":
+            return float(item.get("score", 0.0))
+    return 0.0
 
 
-    nsfw_score = 0.0
-
-
-    for item in results:
-
-        label = str(
-            item.get(
-                "label",
-                ""
-            )
-        ).lower()
-
-
-        if label == "nsfw":
-
-            nsfw_score = float(
-                item.get(
-                    "score",
-                    0.0
-                )
-            )
-
-            break
-
-
-    return nsfw_score
-
-
-# ============================================================
-# NSFW TELEGRAM ALERT
-# ============================================================
-
-def send_nsfw_alert(
-    score
-):
-
+def send_nsfw_alert(score):
     global last_nsfw_alert_time
 
-
     now = time.time()
-
-
-    # Prevent repeated Telegram alerts.
-    if (
-        now - last_nsfw_alert_time
-        < NSFW_COOLDOWN_SECONDS
-    ):
-
+    if now - last_nsfw_alert_time < NSFW_COOLDOWN_SECONDS:
         return
-
 
     if not authorized_chat_id:
-
-        log(
-            "NSFW detected but no Telegram "
-            "account is paired."
-        )
-
+        log("NSFW detected but no Telegram account is paired.")
         return
-
 
     message = (
         "⚠️ SAFETY ALERT\n\n"
-        "Potentially inappropriate content "
-        "was detected on the child's screen.\n\n"
+        "Potentially inappropriate content was detected on the child's screen.\n\n"
         f"Detection score: {score:.2f}\n\n"
         "A safety intervention has been started."
     )
 
-
-    if send_telegram_message(
-        authorized_chat_id,
-        message
-    ):
-
+    if send_telegram_message(authorized_chat_id, message):
         last_nsfw_alert_time = now
 
 
-# ============================================================
-# OPEN YOUTUBE ONCE
-# ============================================================
-
 def open_youtube():
-
-    log(
-        "Opening YouTube intervention video."
-    )
-
-
+    log("Opening YouTube intervention video.")
     try:
-
-        subprocess.Popen(
-            [
-                "open",
-                YOUTUBE_URL
-            ]
-        )
-
-
-        log(
-            "YouTube opened successfully."
-        )
-
-
+        webbrowser.open(YOUTUBE_URL)
+        log("YouTube opened successfully.")
     except Exception as e:
-
-        log(
-            f"Could not open YouTube: {e}"
-        )
+        log(f"Could not open YouTube: {e}")
 
 
-# ============================================================
-# INTERVENTION
-# ============================================================
-
-def enforce_nsfw_intervention(
-    score
-):
-
-    log(
-        f"NSFW intervention started. "
-        f"Score={score:.2f}"
-    )
-
-
-    # --------------------------------------------------------
-    # 1. Telegram
-    # --------------------------------------------------------
-
-    send_nsfw_alert(
-        score
-    )
-
-
-    # --------------------------------------------------------
-    # 2. Open YouTube ONLY ONCE
-    # --------------------------------------------------------
-
+def enforce_nsfw_intervention(score):
+    log(f"NSFW intervention started. Score={score:.2f}")
+    send_nsfw_alert(score)
     open_youtube()
 
-
-    # --------------------------------------------------------
-    # 3. No pmset.
-    #
-    # We DO NOT repeatedly put the display to sleep.
-    # --------------------------------------------------------
-
-    log(
-        "5-minute NSFW intervention cooldown started."
-    )
-
-
-    end_time = (
-        time.time()
-        + LOCKOUT_DURATION
-    )
-
-
-    while (
-        time.time() < end_time
-        and monitor_running
-    ):
-
+    log("5-minute NSFW intervention cooldown started.")
+    end_time = time.time() + LOCKOUT_DURATION
+    while time.time() < end_time and monitor_running:
         time.sleep(1)
-
-
-    log(
-        "NSFW intervention cooldown finished."
-    )
+    log("NSFW intervention cooldown finished.")
 
 
 # ============================================================
-# ADDICTION MODEL BACKGROUND WORKER
+# ADDICTION WORKER
 # ============================================================
-
-def addiction_monitor_worker(
-    preprocessor,
-    model,
-    feature_columns
-):
-
-    global monitor_running
-
-
+def addiction_monitor_worker(preprocessor, model, feature_columns):
     while monitor_running:
-
         try:
-
-            (
-                prediction,
-                probability,
-                features
-            ) = predict_addiction(
-                preprocessor,
-                model,
-                feature_columns
+            _, probability, features = predict_addiction(
+                preprocessor, model, feature_columns
             )
+            log(f"Addiction prediction: {probability:.4f}")
+            print(f"🧠 Addiction risk: {probability:.1%}", flush=True)
 
-
-            log(
-                "Addiction prediction: "
-                f"{probability:.4f}"
-            )
-
-
-            print(
-                f"🧠 Addiction risk: "
-                f"{probability:.1%}"
-            )
-
-
-            if (
-                probability
-                >= ADDICTION_HIGH_RISK_THRESHOLD
-            ):
-
-                send_addiction_alert(
-                    probability,
-                    features
-                )
-
+            if probability >= ADDICTION_HIGH_RISK_THRESHOLD:
+                send_addiction_alert(probability, features)
 
         except Exception as e:
+            log(f"Addiction monitor error: {e}")
+            print(f"⚠️ Addiction monitor: {e}", flush=True)
 
-            log(
-                f"Addiction monitor error: {e}"
-            )
-
-            print(
-                f"⚠️ Addiction monitor: {e}"
-            )
-
-
-        # ----------------------------------------------------
-        # Check every 5 minutes.
-        # ----------------------------------------------------
-
-        for _ in range(
-            ADDICTION_CHECK_INTERVAL
-        ):
-
+        for _ in range(ADDICTION_CHECK_INTERVAL):
             if not monitor_running:
-
                 break
-
             time.sleep(1)
 
 
 # ============================================================
-# STARTUP
+# MAIN
 # ============================================================
-
 def main():
-
     global monitor_running
 
-
-    print()
     print("=" * 60)
     print("             EGATE AI MONITOR")
-    print("=" * 60)
-    print()
+    print("=" * 60, flush=True)
 
-
-    log("")
     log("=" * 60)
     log("EGATE AI MONITOR STARTING")
+    log(f"Data folder: {DATA_DIR}")
     log("=" * 60)
 
-
-    # ========================================================
-    # TELEGRAM TOKEN
-    # ========================================================
-
     if not TELEGRAM_TOKEN:
-
-        print(
-            "❌ TELEGRAM_BOT_TOKEN is not set."
-        )
-
-        print()
-        print(
-            'Run:'
-        )
-
-        print(
-            'export TELEGRAM_BOT_TOKEN="YOUR_TOKEN"'
-        )
-
+        print("❌ TELEGRAM_BOT_TOKEN is not set (put it in src/.env).")
+        log("TELEGRAM_BOT_TOKEN missing.")
         return
 
-
-    # ========================================================
-    # TELEGRAM CONNECTION
-    # ========================================================
-
-    info = telegram_api(
-        "getMe"
-    )
-
-
+    info = telegram_api("getMe")
     if not info or not info.get("ok"):
-
-        print(
-            "❌ Telegram connection failed."
-        )
-
-        log(
-            f"Telegram connection failed: {info}"
-        )
-
+        print("❌ Telegram connection failed (check token / internet / firewall).")
+        log(f"Telegram connection failed: {info}")
         return
 
+    print(f"✅ Telegram bot: @{info['result'].get('username', 'unknown')}", flush=True)
 
-    bot_username = (
-        info["result"]
-        .get(
-            "username",
-            "unknown"
-        )
-    )
+    load_authorized_chat()
+    load_pending_codes()
 
-
-    print(
-        f"✅ Telegram bot: @{bot_username}"
-    )
-
-
-    # ========================================================
-    # START TELEGRAM LISTENER
-    # ========================================================
-
-    telegram_thread = threading.Thread(
-        target=telegram_listener,
-        daemon=True
-    )
-
-    telegram_thread.start()
-
-
-    # Give listener time to start.
-    time.sleep(2)
-
-
-    # ========================================================
-    # REGISTRATION
-    # ========================================================
-    # Pairing now happens from the Streamlit dashboard instead
-    # of this terminal. This thread just watches for a code the
-    # dashboard writes to disk, at any point while the monitor
-    # is running — not only at startup.
-
-    code_watcher_thread = threading.Thread(
-        target=code_submission_watcher,
-        daemon=True
-    )
-
-    code_watcher_thread.start()
+    threading.Thread(target=telegram_listener, daemon=True).start()
+    threading.Thread(target=code_submission_watcher, daemon=True).start()
 
     if authorized_chat_id:
-
-        print(
-            "✅ Existing Telegram pairing found."
-        )
-
+        print("✅ Existing Telegram pairing found.")
     else:
+        print("⚠️ Telegram account is not paired yet. Use the dashboard to pair.")
 
-        print(
-            "⚠️ Telegram account is not paired yet."
-        )
-
-        print(
-            "Open the Egate AI dashboard's 'Pair Telegram' "
-            "section to finish pairing — the monitor will keep "
-            "running and pick it up automatically."
-        )
-
-
-    # ========================================================
-    # LOAD ADDICTION MODEL
-    # ========================================================
-
-    print()
-    print(
-        "Loading addiction model..."
-    )
-
-
+    print("Loading addiction model...", flush=True)
     try:
-
-        (
-            preprocessor,
-            addiction_model,
-            feature_columns
-        ) = load_addiction_model()
-
-
-        print(
-            "✅ Addiction model loaded."
-        )
-
-
-        print()
-        print(
-            "Model features:"
-        )
-
-
-        for column in feature_columns:
-
-            print(
-                " -",
-                column
-            )
-
-
+        preprocessor, addiction_model, feature_columns = load_addiction_model()
+        print("✅ Addiction model loaded.")
+        threading.Thread(
+            target=addiction_monitor_worker,
+            args=(preprocessor, addiction_model, feature_columns),
+            daemon=True,
+        ).start()
     except Exception as e:
+        print(f"⚠️ Addiction model unavailable (continuing): {e}")
+        log(f"Addiction model loading error: {e}")
 
-        print(
-            f"❌ Could not load addiction model: {e}"
-        )
-
-        log(
-            f"Addiction model loading error: {e}"
-        )
-
-        return
-
-
-    # ========================================================
-    # START ADDICTION WORKER
-    # ========================================================
-
-    addiction_thread = threading.Thread(
-        target=addiction_monitor_worker,
-        args=(
-            preprocessor,
-            addiction_model,
-            feature_columns
-        ),
-        daemon=True
-    )
-
-    addiction_thread.start()
-
-
-    # ========================================================
-    # LOAD NSFW MODEL
-    # ========================================================
-
-    print()
-    print(
-        "Loading NSFW detection model..."
-    )
-
-
+    print("Loading NSFW detection model...", flush=True)
     try:
-
-        nsfw_classifier = (
-            load_nsfw_model()
-        )
-
-
-        print(
-            "✅ NSFW model loaded."
-        )
-
-
+        nsfw_classifier = load_nsfw_model()
+        print("✅ NSFW model loaded.")
     except Exception as e:
+        print(f"⚠️ NSFW model failed (Telegram pairing still available): {e}")
+        log(f"NSFW model loading error: {e}")
+        nsfw_classifier = None
 
-        print(
-            f"❌ NSFW model failed: {e}"
-        )
-
-        log(
-            f"NSFW model loading error: {e}"
-        )
-
-        return
-
-
-    # ========================================================
-    # READY
-    # ========================================================
-
-    print()
     print("=" * 60)
     print("🟢 EGATE AI IS RUNNING")
     print("=" * 60)
-    print()
-    print(
-        "NSFW monitoring: ON"
-    )
-
-    print(
-        "Addiction monitoring: ON"
-    )
-
-    print(
-        "Telegram alerts: "
-        + (
-            "ON"
-            if authorized_chat_id
-            else "OFF"
-        )
-    )
-
-    print()
-    print(
-        "Press Control+C to stop."
-    )
-    print()
-
-
-    log(
-        "Egate AI monitoring started."
-    )
-
-
-    # ========================================================
-    # MAIN NSFW LOOP
-    # ========================================================
+    print("Telegram alerts: " + ("ON" if authorized_chat_id else "OFF (not paired)"))
+    print("Press Ctrl+C to stop.", flush=True)
+    log("Egate AI monitoring started.")
 
     try:
-
         while monitor_running:
+            if nsfw_classifier is not None:
+                try:
+                    screen = ImageGrab.grab().convert("RGB")
+                    nsfw_score = get_nsfw_score(nsfw_classifier, screen)
+                    log(f"Screen scanned. NSFW score={nsfw_score:.4f}")
 
-            # -----------------------------------------------
-            # Capture screenshot
-            # -----------------------------------------------
+                    if nsfw_score >= NSFW_THRESHOLD:
+                        print(f"⚠️ NSFW detected: {nsfw_score:.2f}", flush=True)
+                        enforce_nsfw_intervention(nsfw_score)
+                except Exception as e:
+                    log(f"Screen scan error: {e}")
 
-            screen = (
-                ImageGrab
-                .grab()
-                .convert("RGB")
-            )
-
-
-            # -----------------------------------------------
-            # NSFW model
-            # -----------------------------------------------
-
-            nsfw_score = get_nsfw_score(
-                nsfw_classifier,
-                screen
-            )
-
-
-            log(
-                f"Screen scanned. "
-                f"NSFW score={nsfw_score:.4f}"
-            )
-
-
-            # -----------------------------------------------
-            # NSFW detected
-            # -----------------------------------------------
-
-            if nsfw_score >= NSFW_THRESHOLD:
-
-                print(
-                    f"⚠️ NSFW detected: "
-                    f"{nsfw_score:.2f}"
-                )
-
-
-                enforce_nsfw_intervention(
-                    nsfw_score
-                )
-
-
-            time.sleep(
-                CHECK_INTERVAL_SECONDS
-            )
-
+            time.sleep(CHECK_INTERVAL_SECONDS)
 
     except KeyboardInterrupt:
-
-        print()
-        print(
-            "🛑 Stopping Egate AI..."
-        )
-
-
-        log(
-            "--- Egate AI stopped by user ---"
-        )
-
-
-        monitor_running = False
-
-
+        print("🛑 Stopping Egate AI...")
+        log("--- Egate AI stopped by user ---")
     except Exception as e:
-
-        print(
-            f"❌ Main monitor error: {e}"
-        )
-
-
-        log(
-            f"Main monitor error: {e}"
-        )
-
-
+        print(f"❌ Main monitor error: {e}")
+        log(f"Main monitor error: {e}")
+    finally:
         monitor_running = False
 
+    print("✅ Egate AI stopped.")
 
-    print(
-        "✅ Egate AI stopped."
-    )
-
-
-# ============================================================
-# RUN
-# ============================================================
 
 if __name__ == "__main__":
-
     main()
